@@ -63,7 +63,32 @@ void JavaHooks::register_hook_callback(const char *clazz, const char *method, co
 bool JavaHooks::retransform(const char *name) {
     printf("retransform %s\n", name);
     classes.emplace_back(name);
-    return true;
+    jint classCount = 0;
+    jclass *loadedClasses = nullptr;
+
+    if (jvmti->GetLoadedClasses(&classCount, &loadedClasses) != JVMTI_ERROR_NONE) {
+        return false;
+    }
+
+    std::string targetSignature = "L" + std::string(name) + ";";
+
+    jclass target = nullptr;
+
+    for (jint i = 0; i < classCount; i++) {
+        char *signature = nullptr;
+
+        if (jvmti->GetClassSignature(loadedClasses[i], &signature, nullptr) == JVMTI_ERROR_NONE && signature) {
+            if (targetSignature == signature) {
+                target = loadedClasses[i];
+                jvmti->Deallocate(reinterpret_cast<unsigned char *>(signature));
+                break;
+            }
+            jvmti->Deallocate(reinterpret_cast<unsigned char *>(signature));
+        }
+    }
+
+    jvmti->Deallocate(reinterpret_cast<unsigned char *>(loadedClasses));
+    return jvmti->RetransformClasses(1, &target) == JVMTI_ERROR_NONE;
 }
 
 thread_local bool inHook = false;
@@ -100,22 +125,41 @@ void JNICALL JavaHooks::ClassFileLoadHook(
     jstring str = env->NewStringUTF(name);
 
     jbyteArray output = (jbyteArray) env->CallStaticObjectMethod(javaHook_class, processMethod, str, input);
-
     if (std::ranges::find(classes, name) != classes.end()) {
         printf("[javahooks] hooked %s\n", name);
-        if (output == nullptr) {
-            inHook = false;
-            return;
+
+        if (!output) {
+            goto cleanup;
         }
+
         jint length = env->GetArrayLength(output);
-        if (length == 0) {
-            inHook = false;
-            return;
+        if (length <= 0) {
+            goto cleanup;
         }
+
+        unsigned char *transformedClassData = nullptr;
+
+        if (jvmti->Allocate(length, &transformedClassData) != JVMTI_ERROR_NONE || !transformedClassData) {
+            goto cleanup;
+        }
+
+        env->GetByteArrayRegion(output, 0, length, reinterpret_cast<jbyte *>(transformedClassData));
+
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            jvmti->Deallocate(transformedClassData);
+            goto cleanup;
+        }
+
         *new_class_data_len = length;
-        *new_class_data = (unsigned char *) env->GetByteArrayElements(output, 0);
-    } else {
+        *new_class_data = transformedClassData;
     }
+
+cleanup:
+    if (output) env->DeleteLocalRef(output);
+    env->DeleteLocalRef(input);
+    env->DeleteLocalRef(str);
 
     inHook = false;
 }
